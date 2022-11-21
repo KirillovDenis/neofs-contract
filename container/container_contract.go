@@ -32,6 +32,18 @@ type (
 		token []byte
 	}
 
+	ExtendedACLChunks struct {
+		containerID []byte
+		version     []byte
+	}
+
+	Ruleset struct {
+		id      int
+		prev    int
+		next    int
+		records []byte
+	}
+
 	estimation struct {
 		from interop.PublicKey
 		size int
@@ -51,6 +63,9 @@ const (
 	nnsRootKey         = "nnsRoot"
 	nnsHasAliasKey     = "nnsHasAlias"
 	notaryDisabledKey  = "notary"
+
+	counterPrefixKey byte = 'i'
+	rulesetKey            = "ruleset"
 
 	// RegistrationFeeKey is a key in netmap config which contains fee for container registration.
 	RegistrationFeeKey = "ContainerFee"
@@ -82,6 +97,8 @@ const (
 
 var (
 	eACLPrefix = []byte("eACL")
+
+	eACLChunkPrefix = []byte("eACLChunk")
 )
 
 // OnNEP11Payment is needed for registration with contract as the owner to work.
@@ -484,6 +501,232 @@ func SetEACL(eACL []byte, signature interop.Signature, publicKey interop.PublicK
 	runtime.Notify("SetEACLSuccess", containerID, publicKey)
 }
 
+// InsertEACLRuleset append EACL ruleset to the specific position in ruleset list.
+// ContainerID is 32 byte hash. VersionStrut is protobuf encoded version.
+func InsertEACLRuleset(containerID []byte, versionStruct []byte, prev, next int, data []byte) int {
+	ctx := storage.GetContext()
+
+	ownerID := getOwnerByID(ctx, containerID)
+	if ownerID == nil {
+		panic(NotFoundError)
+	}
+
+	createTableIfNotExist(ctx, containerID, versionStruct)
+	return insertRuleset(ctx, containerID, prev, next, data)
+}
+
+// AppendEACLRuleset append EACL ruleset to the end of ruleset list.
+// ContainerID is 32 byte hash. VersionStrut is protobuf encoded version.
+// Data is a stable marshaled eacl records.
+func AppendEACLRuleset(containerID []byte, versionStruct []byte, data []byte) int {
+	ctx := storage.GetContext()
+
+	ownerID := getOwnerByID(ctx, containerID)
+	if ownerID == nil {
+		panic(NotFoundError)
+	}
+
+	createTableIfNotExist(ctx, containerID, versionStruct)
+
+	tail := findLinkedItem(ctx, containerID, false)
+	if tail == 0 {
+		return insertRuleset(ctx, containerID, 0, 0, data)
+	}
+
+	return insertRuleset(ctx, containerID, tail, 0, data)
+}
+
+func PrependEACLRuleset(containerID []byte, versionStruct []byte, data []byte) int {
+	ctx := storage.GetContext()
+
+	ownerID := getOwnerByID(ctx, containerID)
+	if ownerID == nil {
+		panic(NotFoundError)
+	}
+
+	createTableIfNotExist(ctx, containerID, versionStruct)
+
+	head := findLinkedItem(ctx, containerID, true)
+	if head == 0 {
+		return insertRuleset(ctx, containerID, 0, 0, data)
+	}
+
+	return insertRuleset(ctx, containerID, 0, head, data)
+}
+
+func ReplaceEACLRuleset(containerID []byte, id int, data []byte) {
+	ctx := storage.GetContext()
+
+	ownerID := getOwnerByID(ctx, containerID)
+	if ownerID == nil {
+		panic(NotFoundError)
+	}
+
+	getTableInfo(ctx, containerID) // check table existence
+
+	key := formRulesetKey(containerID, id)
+	ruleset := getRuleset(ctx, key)
+	ruleset.records = data
+
+	common.SetSerialized(ctx, key, ruleset)
+}
+
+func DeleteEACLRuleset(containerID []byte, id int) {
+	ctx := storage.GetContext()
+
+	ownerID := getOwnerByID(ctx, containerID)
+	if ownerID == nil {
+		panic(NotFoundError)
+	}
+
+	getTableInfo(ctx, containerID) // check table existence
+
+	key := formRulesetKey(containerID, id)
+	ruleset := getRuleset(ctx, key)
+
+	if ruleset.prev > 0 {
+		prevKey := formRulesetKey(containerID, ruleset.prev)
+		prevRuleset := getRuleset(ctx, prevKey)
+		prevRuleset.next = ruleset.next
+		common.SetSerialized(ctx, prevKey, prevRuleset)
+	}
+
+	if ruleset.next > 0 {
+		nextKey := formRulesetKey(containerID, ruleset.next)
+		nextRuleset := getRuleset(ctx, nextKey)
+		nextRuleset.prev = ruleset.prev
+		common.SetSerialized(ctx, nextKey, nextRuleset)
+	}
+
+	storage.Delete(ctx, key)
+}
+
+func createTableIfNotExist(ctx storage.Context, containerID, versionStruct []byte) {
+	tableKey := append(eACLChunkPrefix, containerID...)
+	tableBytes := storage.Get(ctx, tableKey).([]byte)
+	if tableBytes == nil {
+		table := ExtendedACLChunks{
+			containerID: containerID,
+			version:     versionStruct,
+		}
+		common.SetSerialized(ctx, tableKey, table)
+	}
+}
+
+func getTableInfo(ctx storage.Context, containerID []byte) ExtendedACLChunks {
+	tableKey := append(eACLChunkPrefix, containerID...)
+	tableBytes := storage.Get(ctx, tableKey).([]byte)
+	if tableBytes == nil {
+		panic("table doesn't exist")
+	}
+
+	return std.Deserialize(tableBytes).(ExtendedACLChunks)
+}
+
+func insertRuleset(ctx storage.Context, containerID []byte, prev, next int, data []byte) int {
+	if prev == 0 && next == 0 && countRulesets(ctx, containerID) != 0 {
+		panic("invalid ruleset position")
+	}
+
+	rulesetCounter := updateCounter(ctx, containerID)
+
+	if prev > 0 {
+		updateLinkedItem(ctx, containerID, prev, false, rulesetCounter)
+	}
+	if next > 0 {
+		updateLinkedItem(ctx, containerID, next, true, rulesetCounter)
+	}
+
+	putRuleset(ctx, containerID, rulesetCounter, prev, next, data)
+
+	return rulesetCounter
+}
+
+func countRulesets(ctx storage.Context, containerID []byte) int {
+	prefix := append([]byte(rulesetKey), containerID...)
+	it := storage.Find(ctx, prefix, storage.KeysOnly)
+
+	count := 0
+	for iterator.Next(it) {
+		count++
+	}
+
+	return count
+}
+
+func putRuleset(ctx storage.Context, containerID []byte, id, prev, next int, data []byte) {
+	key := formRulesetKey(containerID, id)
+	ruleSet := Ruleset{
+		id:      id,
+		prev:    prev,
+		next:    next,
+		records: data,
+	}
+	common.SetSerialized(ctx, key, ruleSet)
+}
+
+func getRuleset(ctx storage.Context, key []byte) Ruleset {
+	rulesetBytes := storage.Get(ctx, key).([]byte)
+	if rulesetBytes == nil {
+		panic("not found ruleset")
+	}
+
+	return std.Deserialize(rulesetBytes).(Ruleset)
+}
+
+func updateCounter(ctx storage.Context, containerID []byte) int {
+	counterKey := append([]byte{counterPrefixKey}, containerID...)
+	raw := storage.Get(ctx, counterKey)
+	rulesetCounter := 0
+	if raw != nil {
+		rulesetCounter = raw.(int)
+	}
+	rulesetCounter++
+	storage.Put(ctx, counterKey, rulesetCounter)
+
+	return rulesetCounter
+}
+
+func formRulesetKey(containerID []byte, id int) []byte {
+	counterBytes := std.Serialize(id)
+	return append([]byte(rulesetKey), append(containerID, counterBytes...)...)
+}
+
+func updateLinkedItem(ctx storage.Context, containerID []byte, id int, setPrev bool, val int) {
+	key := formRulesetKey(containerID, id)
+	rulesetBytes := storage.Get(ctx, key).([]byte)
+	if rulesetBytes == nil {
+		panic("invalid ruleset id")
+	}
+
+	prevRuleset := std.Deserialize(rulesetBytes).(Ruleset)
+	if setPrev {
+		prevRuleset.prev = val
+	} else {
+		prevRuleset.next = val
+	}
+	common.SetSerialized(ctx, key, prevRuleset)
+}
+
+// findLinkedItem looks for head or tail id in rulesets list. If no item is found then returns 0.
+// We use 0 instead of -1 as no link to prev item for head or next item for tail because using negative
+// number require much more bytes https://developers.google.com/protocol-buffers/docs/encoding#signed-ints
+// (we don't use "ZigZag" encoding).
+func findLinkedItem(ctx storage.Context, containerID []byte, needHead bool) int {
+	prefix := append([]byte(rulesetKey), containerID...)
+	it := storage.Find(ctx, prefix, storage.ValuesOnly|storage.DeserializeValues)
+	for iterator.Next(it) {
+		rs := iterator.Value(it).(Ruleset)
+
+		if rs.prev == 0 && needHead ||
+			rs.next == 0 && !needHead {
+			return rs.id
+		}
+	}
+
+	return 0
+}
+
 // EACL method returns a structure that contains a stable marshaled EACLTable structure,
 // the signature, the public key of the extended ACL setter and a stable marshaled SessionToken
 // structure if it was provided.
@@ -499,6 +742,203 @@ func EACL(containerID []byte) ExtendedACL {
 
 	return getEACL(ctx, containerID)
 }
+
+func EACLChunked(containerID []byte) ExtendedACL {
+	ctx := storage.GetReadOnlyContext()
+
+	ownerID := getOwnerByID(ctx, containerID)
+	if ownerID == nil {
+		panic(NotFoundError)
+	}
+
+	table := getTableInfo(ctx, containerID)
+	rulesets := EACLRulesets(containerID)
+
+	eaclTable := mergeChunksToTable(table, rulesets)
+
+	return ExtendedACL{
+		value: eaclTable,
+		sig:   interop.Signature{},
+		pub:   interop.PublicKey{},
+		token: []byte{},
+	}
+}
+
+func EACLRulesets(containerID []byte) []Ruleset {
+	ctx := storage.GetReadOnlyContext()
+
+	ownerID := getOwnerByID(ctx, containerID)
+	if ownerID == nil {
+		panic(NotFoundError)
+	}
+
+	rulesetMap := make(map[int]Ruleset)
+	nextID := 0
+
+	prefix := append([]byte(rulesetKey), containerID...)
+	it := storage.Find(ctx, prefix, storage.ValuesOnly|storage.DeserializeValues)
+	for iterator.Next(it) {
+		rs := iterator.Value(it).(Ruleset)
+		rulesetMap[rs.id] = rs
+		if rs.prev == 0 {
+			nextID = rs.id
+		}
+	}
+
+	if nextID == 0 && len(rulesetMap) > 0 {
+		panic("invalid linked ruleset list")
+	}
+
+	result := []Ruleset{}
+	var rs Ruleset
+	for nextID > 0 {
+		rs = rulesetMap[nextID]
+		result = append(result, rs)
+		nextID = rs.next
+	}
+
+	return result
+}
+
+const (
+	tableVersionField   = 1
+	tableContainerField = 2
+	tableRecordsField   = 3
+
+	containerIDField = 1
+)
+
+// assume cnrID and version are encoded
+func mergeChunksToTable(eaclChunkTable ExtendedACLChunks, rulesets []Ruleset) []byte {
+	encodedVersion := encodeVersion(eaclChunkTable.version)
+	encodedCnrID := encodeContainerID(eaclChunkTable.containerID)
+
+	result := append(encodedVersion, encodedCnrID...)
+
+	recordPrefix := tableRecordsField<<3 | 0x02
+	for i := range rulesets {
+		chunkRecs := rulesets[i].records
+		if len(chunkRecs) < 2 {
+			continue
+		}
+
+		result = append(result, byte(recordPrefix))
+		result = append(result, chunkRecs[1:]...)
+	}
+
+	return result
+}
+
+func encodeVersion(version []byte) []byte {
+	versionLen := uint64(len(version))
+	versionBuffer := make([]byte, 1+varUIntSize(versionLen)+len(version))
+
+	versionBuffer[0] = tableVersionField<<3 | 0x02
+	versionOffset := putUvarint(versionBuffer, 1, versionLen) + 1
+
+	copy(versionBuffer[versionOffset:], version)
+
+	return versionBuffer
+}
+
+func encodeContainerID(cnrID []byte) []byte {
+	cnrIDLen := uint64(len(cnrID))
+	cnrIDBufferSize := 1 + varUIntSize(cnrIDLen) + len(cnrID)
+	cnrIDStructLen := uint64(cnrIDBufferSize)
+	cnrIDStructBufferSize := 1 + varUIntSize(cnrIDStructLen) + cnrIDBufferSize
+
+	cnrIDStructBuffer := make([]byte, cnrIDStructBufferSize)
+
+	cnrIDStructBuffer[0] = tableContainerField<<3 | 0x02
+	cnrIDStructOffset := putUvarint(cnrIDStructBuffer, 1, cnrIDStructLen) + 1
+
+	cnrIDStructBuffer[cnrIDStructOffset] = containerIDField<<3 | 0x02
+	cnrIDStructOffset += putUvarint(cnrIDStructBuffer, cnrIDStructOffset+1, cnrIDLen) + 1
+
+	copy(cnrIDStructBuffer[cnrIDStructOffset:], cnrID)
+
+	return cnrIDStructBuffer
+}
+
+func varintOneByteFieldSize(input []byte) int {
+	if len(input) < 2 || input[0]&7 != 0 { // it isn't a varint
+		return 0
+	}
+
+	end := 2
+	for i, b := range input[1:] {
+		if b>>7 == 0 {
+			end += i
+			break
+		}
+	}
+
+	return end
+}
+
+func varUIntSize(x uint64) int {
+	return (len64(x|1) + 6) / 7
+}
+
+func putUvarint(buf []byte, index int, x uint64) int {
+	i := index
+	for x >= 0x80 {
+		buf[i] = byte(x) | 0x80
+		x = x >> 7
+		i++
+	}
+	buf[i] = byte(x)
+	return i + 1 - index
+}
+
+func encodeUvarint(x uint64) []byte {
+	buf := make([]byte, varUIntSize(x))
+	i := 0
+	for x >= 0x80 {
+		buf[i] = byte(x) | 0x80
+		x = x >> 7
+		i++
+	}
+	buf[i] = byte(x)
+	return buf
+}
+
+// len64 returns the minimum number of bits required to represent x; the result is 0 for x == 0.
+func len64(x uint64) int {
+	var n int
+	if x >= 1<<32 {
+		x = x >> 32
+		n = 32
+	}
+	if x >= 1<<16 {
+		x = x >> 16
+		n += 16
+	}
+	if x >= 1<<8 {
+		x = x >> 8
+		n += 8
+	}
+
+	return n + int(len8tab[x])
+}
+
+const len8tab = "" +
+	"\x00\x01\x02\x02\x03\x03\x03\x03\x04\x04\x04\x04\x04\x04\x04\x04" +
+	"\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05" +
+	"\x06\x06\x06\x06\x06\x06\x06\x06\x06\x06\x06\x06\x06\x06\x06\x06" +
+	"\x06\x06\x06\x06\x06\x06\x06\x06\x06\x06\x06\x06\x06\x06\x06\x06" +
+	"\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07" +
+	"\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07" +
+	"\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07" +
+	"\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07" +
+	"\x08\x08\x08\x08\x08\x08\x08\x08\x08\x08\x08\x08\x08\x08\x08\x08" +
+	"\x08\x08\x08\x08\x08\x08\x08\x08\x08\x08\x08\x08\x08\x08\x08\x08" +
+	"\x08\x08\x08\x08\x08\x08\x08\x08\x08\x08\x08\x08\x08\x08\x08\x08" +
+	"\x08\x08\x08\x08\x08\x08\x08\x08\x08\x08\x08\x08\x08\x08\x08\x08" +
+	"\x08\x08\x08\x08\x08\x08\x08\x08\x08\x08\x08\x08\x08\x08\x08\x08" +
+	"\x08\x08\x08\x08\x08\x08\x08\x08\x08\x08\x08\x08\x08\x08\x08\x08" +
+	"\x08\x08\x08\x08\x08\x08\x08\x08\x08\x08\x08\x08\x08\x08\x08\x08" +
+	"\x08\x08\x08\x08\x08\x08\x08\x08\x08\x08\x08\x08\x08\x08\x08\x08"
 
 // PutContainerSize method saves container size estimation in contract
 // memory. It can be invoked only by Storage nodes from the network map. This method

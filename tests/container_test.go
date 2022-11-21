@@ -3,17 +3,24 @@ package tests
 import (
 	"bytes"
 	"crypto/sha256"
+	"math/big"
 	"path"
 	"testing"
 
 	"github.com/mr-tron/base58"
+	"github.com/nspcc-dev/neo-go/pkg/crypto/keys"
 	"github.com/nspcc-dev/neo-go/pkg/encoding/address"
 	"github.com/nspcc-dev/neo-go/pkg/neotest"
 	"github.com/nspcc-dev/neo-go/pkg/util"
 	"github.com/nspcc-dev/neo-go/pkg/vm/stackitem"
+	"github.com/nspcc-dev/neofs-api-go/v2/refs"
+	"github.com/nspcc-dev/neofs-api-go/v2/util/proto"
 	"github.com/nspcc-dev/neofs-contract/common"
 	"github.com/nspcc-dev/neofs-contract/container"
 	"github.com/nspcc-dev/neofs-contract/nns"
+	cid "github.com/nspcc-dev/neofs-sdk-go/container/id"
+	sdkEacl "github.com/nspcc-dev/neofs-sdk-go/eacl"
+	"github.com/nspcc-dev/neofs-sdk-go/version"
 	"github.com/stretchr/testify/require"
 )
 
@@ -409,4 +416,321 @@ func checkEstimations(t *testing.T, c *neotest.ContractInvoker, epoch int64, cnt
 		}
 		require.True(t, found, "expected estimation from %x to be present", pub)
 	}
+}
+
+func TestContainerChunkedEACL(t *testing.T) {
+	c, cBal, _ := newContainerInvoker(t)
+	_, cnt := addContainer(t, c, cBal)
+
+	var cnrID cid.ID
+	cnrID.SetSHA256(cnt.id)
+
+	vers := version.Current()
+	var versV2 refs.Version
+	vers.WriteToV2(&versV2)
+
+	chunks := prepareTestChunks(t, 3)
+
+	for i, chunk := range chunks {
+		args := []interface{}{cnrID[:], versV2.StableMarshal(nil), chunk.StableRecordsMarshal(nil)}
+
+		expected := stackitem.NewBigInteger(big.NewInt(int64(i + 1)))
+		c.Invoke(t, expected, "appendEACLRuleset", args...)
+	}
+
+	table := formTable(cnrID, vers, chunks)
+	rawTable, err := table.Marshal()
+	require.NoError(t, err)
+
+	expected := stackitem.NewStruct([]stackitem.Item{
+		stackitem.NewBuffer(rawTable),
+		&stackitem.Buffer{},
+		&stackitem.Buffer{},
+		&stackitem.Buffer{},
+	})
+	c.Invoke(t, expected, "eACLChunked", cnrID[:])
+}
+
+func TestContainerRulesetsManage(t *testing.T) {
+	c, cBal, _ := newContainerInvoker(t)
+	_, cnt := addContainer(t, c, cBal)
+
+	var cnrID cid.ID
+	cnrID.SetSHA256(cnt.id)
+
+	vers := version.Current()
+	var versV2 refs.Version
+	vers.WriteToV2(&versV2)
+	versMarshalled := versV2.StableMarshal(nil)
+
+	var counter int64
+
+	t.Run("append", func(t *testing.T) {
+		chunks := prepareTestChunks(t, 3)
+		for _, chunk := range chunks {
+			args := []interface{}{cnrID[:], versMarshalled, chunk.StableRecordsMarshal(nil)}
+
+			counter++
+			expected := stackitem.NewBigInteger(big.NewInt(counter))
+			c.Invoke(t, expected, "appendEACLRuleset", args...)
+		}
+	})
+
+	t.Run("prepend", func(t *testing.T) {
+		rs := Ruleset{Records: prepareTestRecords(t, sdkEacl.ActionAllow, sdkEacl.RoleUnknown)}
+		rsRecordsMarshalled := rs.StableRecordsMarshal(nil)
+		args := []interface{}{cnrID[:], versMarshalled, rsRecordsMarshalled}
+
+		counter++
+		expected := stackitem.NewBigInteger(big.NewInt(counter))
+		c.Invoke(t, expected, "prependEACLRuleset", args...)
+
+		rulesets := getRulesets(t, c, cnrID)
+		require.Len(t, rulesets, 4)
+		require.Equal(t, counter, rulesets[0].ID)
+		require.Equal(t, rsRecordsMarshalled, rulesets[0].Records)
+	})
+
+	t.Run("insert", func(t *testing.T) {
+		rs := Ruleset{Records: prepareTestRecords(t, sdkEacl.ActionAllow, sdkEacl.RoleUnknown)}
+		rsRecordsMarshalled := rs.StableRecordsMarshal(nil)
+		prev := counter
+		next := int64(1)
+		args := []interface{}{cnrID[:], versMarshalled, prev, next, rsRecordsMarshalled}
+		counter++
+		expected := stackitem.NewBigInteger(big.NewInt(counter))
+		c.Invoke(t, expected, "insertEACLRuleset", args...)
+
+		rulesets := getRulesets(t, c, cnrID)
+		require.Len(t, rulesets, 5)
+		require.Equal(t, counter, rulesets[1].ID)
+		require.Equal(t, rsRecordsMarshalled, rulesets[1].Records)
+		require.Equal(t, prev, rulesets[0].ID)
+		require.Equal(t, rulesets[1].ID, rulesets[0].Next)
+		require.Equal(t, next, rulesets[2].ID)
+		require.Equal(t, rulesets[1].ID, rulesets[2].Prev)
+	})
+
+	t.Run("replace", func(t *testing.T) {
+		rs := Ruleset{Records: prepareTestRecords(t, sdkEacl.ActionAllow, sdkEacl.RoleUnknown)}
+		rsRecordsMarshalled := rs.StableRecordsMarshal(nil)
+		args := []interface{}{cnrID[:], counter, rsRecordsMarshalled}
+
+		rulesetsExpected := getRulesets(t, c, cnrID)
+		rulesetsExpected[1].Records = rsRecordsMarshalled
+
+		c.Invoke(t, stackitem.Null{}, "replaceEACLRuleset", args...)
+
+		rulesets := getRulesets(t, c, cnrID)
+		require.Len(t, rulesets, 5)
+		require.Equal(t, counter, rulesets[1].ID)
+		require.Equal(t, rsRecordsMarshalled, rulesets[1].Records)
+		compareRecordsBytes(t, rulesetsExpected, rulesets)
+	})
+
+	t.Run("delete", func(t *testing.T) {
+		c.InvokeFail(t, "not found ruleset", "deleteEACLRuleset", cnrID[:], 123)
+
+		rulesetsBefore := getRulesets(t, c, cnrID)
+		rulesetsExpected := append(rulesetsBefore[:1], rulesetsBefore[2:]...)
+
+		c.Invoke(t, stackitem.Null{}, "deleteEACLRuleset", cnrID[:], counter)
+
+		rulesets := getRulesets(t, c, cnrID)
+		require.Len(t, rulesets, 4)
+		require.Equal(t, -1, getIndexByIDRuleset(rulesets, counter))
+		require.Equal(t, rulesets[0].Next, rulesets[1].ID)
+		require.Equal(t, rulesets[0].ID, rulesets[1].Prev)
+		compareRecordsBytes(t, rulesetsExpected, rulesets)
+	})
+}
+
+func getIndexByIDRuleset(rulesets []ContractRuleset, id int64) int {
+	for i, rs := range rulesets {
+		if rs.ID == id {
+			return i
+		}
+	}
+
+	return -1
+}
+
+func compareRecordsBytes(t *testing.T, list1, list2 []ContractRuleset) {
+	require.Equal(t, len(list1), len(list2), "lists have different length")
+
+	for i, ruleset := range list1 {
+		require.Truef(t, bytes.Equal(ruleset.Records, list2[i].Records), "different records for index %d", i)
+	}
+}
+
+func getRulesets(t *testing.T, c *neotest.ContractInvoker, cnrID cid.ID) []ContractRuleset {
+	s, err := c.TestInvoke(t, "eACLRulesets", cnrID[:])
+	require.NoError(t, err)
+
+	arr := s.Pop().Array()
+
+	res := make([]ContractRuleset, len(arr))
+	for i, el := range arr {
+		ruleset := el.Value().([]stackitem.Item)
+		id, err := ruleset[0].TryInteger()
+		require.NoError(t, err)
+		prev, err := ruleset[1].TryInteger()
+		require.NoError(t, err)
+		next, err := ruleset[2].TryInteger()
+		require.NoError(t, err)
+		recs, err := ruleset[3].TryBytes()
+		require.NoError(t, err)
+
+		res[i].ID = id.Int64()
+		res[i].Prev = prev.Int64()
+		res[i].Next = next.Int64()
+		res[i].Records = recs
+	}
+
+	return res
+}
+
+const (
+	rulesetIDFieldNumber      = 1
+	rulesetPrevIDNumber       = 2
+	rulesetNextIDNumber       = 3
+	rulesetRecordsFieldNumber = 4
+)
+
+type Ruleset struct {
+	ID      int64
+	Prev    int64
+	Next    int64
+	Records []sdkEacl.Record
+}
+
+type ContractRuleset struct {
+	ID      int64
+	Prev    int64
+	Next    int64
+	Records []byte
+}
+
+// StableSize of acl table structure marshalled by StableMarshal function.
+func (c *Ruleset) StableSize() (size int) {
+	if c == nil {
+		return 0
+	}
+
+	size += proto.Int64Size(rulesetIDFieldNumber, c.ID)
+	size += proto.Int64Size(rulesetPrevIDNumber, c.Prev)
+	size += proto.Int64Size(rulesetNextIDNumber, c.Next)
+
+	for i := range c.Records {
+		size += proto.NestedStructureSize(rulesetRecordsFieldNumber, c.Records[i].ToV2())
+	}
+
+	return size
+}
+
+func (c *Ruleset) StableMarshal(buf []byte) []byte {
+	if c == nil {
+		return []byte{}
+	}
+
+	if buf == nil {
+		buf = make([]byte, c.StableSize())
+	}
+
+	var offset int
+
+	offset += proto.Int64Marshal(rulesetIDFieldNumber, buf[offset:], c.ID)
+	offset += proto.Int64Marshal(rulesetPrevIDNumber, buf[offset:], c.Prev)
+	offset += proto.Int64Marshal(rulesetNextIDNumber, buf[offset:], c.Next)
+
+	for i := range c.Records {
+		offset += proto.NestedStructureMarshal(rulesetRecordsFieldNumber, buf[offset:], c.Records[i].ToV2())
+	}
+
+	return buf
+}
+func (c *Ruleset) StableRecordsSize() (size int) {
+	if c == nil {
+		return 0
+	}
+
+	for i := range c.Records {
+		size += proto.NestedStructureSize(rulesetRecordsFieldNumber, c.Records[i].ToV2())
+	}
+
+	return size
+}
+
+func (c *Ruleset) StableRecordsMarshal(buf []byte) []byte {
+	if c == nil {
+		return []byte{}
+	}
+
+	if buf == nil {
+		buf = make([]byte, c.StableRecordsSize())
+	}
+
+	var offset int
+
+	for i := range c.Records {
+		offset += proto.NestedStructureMarshal(rulesetRecordsFieldNumber, buf[offset:], c.Records[i].ToV2())
+	}
+
+	return buf
+}
+
+// creates new eacl records. If role different from sdkEacl.RoleOthers random key will be used.
+func prepareTestRecords(t *testing.T, action sdkEacl.Action, role sdkEacl.Role) []sdkEacl.Record {
+	var result []sdkEacl.Record
+
+	target := sdkEacl.NewTarget()
+	if role == sdkEacl.RoleOthers {
+		target.SetRole(role)
+	} else {
+		key, err := keys.NewPrivateKey()
+		require.NoError(t, err)
+
+		target.SetBinaryKeys([][]byte{key.PublicKey().Bytes()})
+	}
+
+	for op := sdkEacl.OperationRangeHash; op <= sdkEacl.OperationRangeHash; op++ {
+		var rec sdkEacl.Record
+		rec.SetAction(action)
+		rec.SetOperation(op)
+		rec.SetTargets(*target)
+
+		result = append(result, rec)
+	}
+
+	return result
+}
+
+func formTable(cnrID cid.ID, vers version.Version, chunks []Ruleset) *sdkEacl.Table {
+	table := sdkEacl.NewTable()
+	table.SetCID(cnrID)
+	table.SetVersion(vers)
+
+	for _, chunk := range chunks {
+		for i := range chunk.Records {
+			table.AddRecord(&chunk.Records[i])
+		}
+	}
+
+	return table
+}
+
+func prepareTestChunks(t *testing.T, length int) []Ruleset {
+	result := make([]Ruleset, length)
+
+	for i := 0; i < length-1; i++ {
+		result[i] = Ruleset{
+			Records: prepareTestRecords(t, sdkEacl.ActionAllow, sdkEacl.RoleUnknown),
+		}
+	}
+
+	result[length-1] = Ruleset{
+		Records: prepareTestRecords(t, sdkEacl.ActionDeny, sdkEacl.RoleOthers),
+	}
+
+	return result
 }
